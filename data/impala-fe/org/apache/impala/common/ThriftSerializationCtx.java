@@ -1,0 +1,143 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package org.apache.impala.common;
+
+import org.apache.impala.analysis.SlotId;
+import org.apache.impala.analysis.TupleId;
+import org.apache.impala.planner.TupleCacheInfo;
+import org.apache.impala.planner.TupleCacheInfo.IneligibilityReason;
+import org.apache.impala.planner.HdfsScanNode;
+
+/**
+ * The Thrift serialization functions need to adjust output based on whether the
+ * Thrift serialization is happening for tuple caching or not. This context is
+ * passed to Thrift serialization functions like initThrift() or toThrift().
+ * The context currently provides a way to determine whether serialization is happening
+ * for tuple caching.
+ *
+ * It also provides several functions that adjust their behavior based on whether
+ * this is for tuple caching or not (e.g. translateTupleId()). This allows
+ * caller to run the function unconditionally without needing extra if/else checks
+ * for tuple caching. e.g.
+ *
+ * struct.id = serialCtx.translateTupleId(id_).asInt();
+ *
+ * rather than:
+ *
+ * if (serialCtx.isTupleCache()) {
+ *   struct.id = serialCtx.translateTupleId(id_).asInt();
+ * } else {
+ *   struct.id = id_.asInt();
+ * }
+ */
+public class ThriftSerializationCtx {
+  private TupleCacheInfo tupleCacheInfo_;
+
+  /**
+   * Constructor for tuple caching serialization
+   */
+  public ThriftSerializationCtx(TupleCacheInfo tupleCacheInfo) {
+    tupleCacheInfo_ = tupleCacheInfo;
+  }
+
+  /**
+   * Constructor for normal serialization
+   */
+  public ThriftSerializationCtx() {
+    tupleCacheInfo_ = null;
+  }
+
+  /**
+   * Returns whether serialization is on behalf of the tuple cache or not. This is
+   * intended to be used to mask out unnecessary fields.
+   */
+  public boolean isTupleCache() {
+    return tupleCacheInfo_ != null;
+  }
+
+  /**
+   * registerTuple() should be called for each TupleId that is referenced from a PlanNode.
+   * This only has an effect for tuple caching.
+   */
+  public void registerTuple(TupleId id) {
+    if (isTupleCache()) {
+      tupleCacheInfo_.registerTuple(id);
+    }
+  }
+
+  /**
+   * registerInputScanNode() is used to keep track of which HdfsScanNodes feed into a
+   * particular location for tuple caching. Tuple caching only supports HDFS tables at
+   * the moment, so this is limited to HdfsScanNode. See TupleCacheInfo for more
+   * information about how this is used.
+   */
+  public void registerInputScanNode(HdfsScanNode hdfsScanNode) {
+    if (isTupleCache()) {
+      tupleCacheInfo_.registerInputScanNode(hdfsScanNode);
+    }
+  }
+
+  /**
+   * Set this location as ineligible for tuple caching due to the specified reason.
+   */
+  public void setTupleCachingIneligible(IneligibilityReason reason) {
+    if (isTupleCache()) {
+      tupleCacheInfo_.setIneligible(reason);
+    }
+  }
+
+  /**
+   * translateTupleId() is designed to be applied to every TupleId incorporated into a
+   * Thrift structure. For tuple caching, translateTupleId() translates the passed in
+   * global TupleId into a local TupleId. All other use cases use the global id, so this
+   * simply returns the globalId passed in. Any TupleId passed into translateTupleId()
+   * must already be registered via registerTuple().
+   */
+  public TupleId translateTupleId(TupleId globalId) {
+    if (isTupleCache()) {
+      return tupleCacheInfo_.getLocalTupleId(globalId);
+    } else {
+      return globalId;
+    }
+  }
+
+  /**
+   * translateSlotId() is designed to be applied to every SlotId incorporated into a
+   * Thrift structure. For tuple caching, translateSlotId() translates the passed in
+   * global SlotId into a local SlotId. All other use cases use the global id, so this
+   * simply returns the globalId passed in.
+   */
+  public SlotId translateSlotId(SlotId globalId) {
+    if (isTupleCache()) {
+      return tupleCacheInfo_.getLocalSlotId(globalId);
+    } else {
+      return globalId;
+    }
+  }
+
+  /**
+   * Incorporate all the scan range information from the children nodes into the
+   * compile-time cache key. This eliminates the need to include these scan ranges
+   * in the runtime key.
+   */
+  public void incorporateScans() {
+    if (isTupleCache()) {
+      tupleCacheInfo_.incorporateScans();
+    }
+  }
+}

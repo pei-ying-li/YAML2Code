@@ -1,0 +1,192 @@
+/*
+ * ====================================================================
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ * ====================================================================
+ *
+ * This software consists of voluntary contributions made by many
+ * individuals on behalf of the Apache Software Foundation.  For more
+ * information on the Apache Software Foundation, please see
+ * <http://www.apache.org/>.
+ *
+ */
+
+package org.apache.hc.client5.http.impl.classic;
+
+import java.io.IOException;
+import java.io.InterruptedIOException;
+
+import org.apache.hc.client5.http.ConnectionKeepAliveStrategy;
+import org.apache.hc.client5.http.HttpRoute;
+import org.apache.hc.client5.http.UserTokenHandler;
+import org.apache.hc.client5.http.classic.ExecChain;
+import org.apache.hc.client5.http.classic.ExecChainHandler;
+import org.apache.hc.client5.http.classic.ExecRuntime;
+import org.apache.hc.client5.http.impl.ConnectionShutdownException;
+import org.apache.hc.client5.http.impl.ProtocolSwitchStrategy;
+import org.apache.hc.client5.http.io.HttpClientConnectionManager;
+import org.apache.hc.client5.http.protocol.HttpClientContext;
+import org.apache.hc.core5.annotation.Contract;
+import org.apache.hc.core5.annotation.Internal;
+import org.apache.hc.core5.annotation.ThreadingBehavior;
+import org.apache.hc.core5.http.ClassicHttpRequest;
+import org.apache.hc.core5.http.ClassicHttpResponse;
+import org.apache.hc.core5.http.ConnectionReuseStrategy;
+import org.apache.hc.core5.http.HttpEntity;
+import org.apache.hc.core5.http.HttpException;
+import org.apache.hc.core5.http.HttpStatus;
+import org.apache.hc.core5.http.ProtocolException;
+import org.apache.hc.core5.http.ProtocolVersion;
+import org.apache.hc.core5.http.protocol.HttpProcessor;
+import org.apache.hc.core5.io.CloseMode;
+import org.apache.hc.core5.util.Args;
+import org.apache.hc.core5.util.TimeValue;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Usually the last request execution handler in the classic request execution
+ * chain that is responsible for execution of request / response exchanges with
+ * the opposite endpoint.
+ *
+ * @since 4.3
+ */
+@Contract(threading = ThreadingBehavior.STATELESS)
+@Internal
+public final class MainClientExec implements ExecChainHandler {
+
+    private static final Logger LOG = LoggerFactory.getLogger(MainClientExec.class);
+
+    private final HttpClientConnectionManager connectionManager;
+    private final HttpProcessor httpProcessor;
+    private final ConnectionReuseStrategy reuseStrategy;
+    private final ConnectionKeepAliveStrategy keepAliveStrategy;
+    private final UserTokenHandler userTokenHandler;
+    private final ProtocolSwitchStrategy protocolSwitchStrategy;
+
+    /**
+     * @since 4.4
+     */
+    public MainClientExec(
+            final HttpClientConnectionManager connectionManager,
+            final HttpProcessor httpProcessor,
+            final ConnectionReuseStrategy reuseStrategy,
+            final ConnectionKeepAliveStrategy keepAliveStrategy,
+            final UserTokenHandler userTokenHandler) {
+        this.connectionManager = Args.notNull(connectionManager, "Connection manager");
+        this.httpProcessor = Args.notNull(httpProcessor, "HTTP protocol processor");
+        this.reuseStrategy = Args.notNull(reuseStrategy, "Connection reuse strategy");
+        this.keepAliveStrategy = Args.notNull(keepAliveStrategy, "Connection keep alive strategy");
+        this.userTokenHandler = Args.notNull(userTokenHandler, "User token handler");
+        this.protocolSwitchStrategy = new ProtocolSwitchStrategy();
+    }
+
+    @Override
+    public ClassicHttpResponse execute(
+            final ClassicHttpRequest request,
+            final ExecChain.Scope scope,
+            final ExecChain chain) throws IOException, HttpException {
+        Args.notNull(request, "HTTP request");
+        Args.notNull(scope, "Scope");
+        final String exchangeId = scope.exchangeId;
+        final HttpRoute route = scope.route;
+        final HttpClientContext context = scope.clientContext;
+        final ExecRuntime execRuntime = scope.execRuntime;
+
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("{} executing {} {}", exchangeId, request.getMethod(), request.getRequestUri());
+        }
+        try {
+            // Run request protocol interceptors
+            context.setRoute(route);
+            context.setRequest(request);
+
+            httpProcessor.process(request, request.getEntity(), context);
+
+            final ClassicHttpResponse response = execRuntime.execute(
+                    exchangeId,
+                    request,
+                    (r, connection, c) -> {
+                        if (r.getCode() == HttpStatus.SC_SWITCHING_PROTOCOLS) {
+                            final ProtocolVersion upgradeProtocol = protocolSwitchStrategy.switchProtocol(r);
+                            if (upgradeProtocol == null || !upgradeProtocol.getProtocol().equals("TLS")) {
+                                throw new ProtocolException("Failure switching protocols");
+                            }
+                            if (LOG.isDebugEnabled()) {
+                                LOG.debug("Switching to {}", upgradeProtocol);
+                            }
+                            try {
+                                execRuntime.upgradeTls(context);
+                            } catch (final IOException ex) {
+                                throw new HttpException("Failure upgrading to TLS", ex);
+                            }
+                            LOG.debug("Successfully switched to {}", upgradeProtocol);
+                        }
+                    },
+                    context);
+
+            context.setResponse(response);
+            httpProcessor.process(response, response.getEntity(), context);
+
+            Object userToken = context.getUserToken();
+            if (userToken == null) {
+                userToken = userTokenHandler.getUserToken(route, request, context);
+                context.setUserToken(userToken);
+            }
+
+            // The connection is in or can be brought to a re-usable state.
+            if (reuseStrategy.keepAlive(request, response, context)) {
+                // Set the idle duration of this connection
+                final TimeValue duration = keepAliveStrategy.getKeepAliveDuration(response, context);
+                if (LOG.isDebugEnabled()) {
+                    final String s;
+                    if (duration != null) {
+                        s = "for " + duration;
+                    } else {
+                        s = "indefinitely";
+                    }
+                    LOG.debug("{} connection can be kept alive {}", exchangeId, s);
+                }
+                execRuntime.markConnectionReusable(userToken, duration);
+            } else {
+                execRuntime.markConnectionNonReusable();
+            }
+            // check for entity, release connection if possible
+            final HttpEntity entity = response.getEntity();
+            if (entity == null || !entity.isStreaming()) {
+                // connection not needed and (assumed to be) in re-usable state
+                execRuntime.releaseEndpoint();
+                return new CloseableHttpResponse(response);
+            }
+            return new CloseableHttpResponse(response, execRuntime);
+        } catch (final ConnectionShutdownException ex) {
+            final InterruptedIOException ioex = new InterruptedIOException(
+                    "Connection has been shut down");
+            ioex.initCause(ex);
+            execRuntime.discardEndpoint();
+            throw ioex;
+        } catch (final HttpException | RuntimeException | IOException ex) {
+            execRuntime.discardEndpoint();
+            throw ex;
+        } catch (final Error error) {
+            connectionManager.close(CloseMode.IMMEDIATE);
+            throw error;
+        }
+
+    }
+
+}
